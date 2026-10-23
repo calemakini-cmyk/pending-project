@@ -1,0 +1,985 @@
+---
+title: "Online Payments Fraud Detection — Tasks 1–5"
+author: "MAKINI CALEB"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 10, fig.height = 6,
+                      dpi = 120, comment = NA)
+```
+
+
+# load libraries
+```{r}
+library(tidyverse)
+library(caret)
+library(psych)
+library(kableExtra)
+library(knitr)
+library(reshape2)
+library(GGally)
+library(scales)
+library(pROC)
+library(yardstick)
+library(randomForest)
+library(gbm)
+library(patchwork)
+library(DALEX)
+library(lime)
+library(corrplot)
+library(pROC)
+library(yardstick)
+library(purrr)
+library(DALEX)
+library(ggplot2)
+ library(patchwork)
+```
+
+
+```{r}
+# Set working directory
+setwd("C:/Users/ADMIN/OneDrive/Desktop/caleb makini/R_poject_Dashboard")
+```
+
+
+## Introduction
+Online payment fraud costs the global economy tens of billions of dollars annually, and because fraud is rare (typically 0.1%–2% of transactions), rule-based systems generate excessive false alarms while black-box machine learning models detect better but cannot justify their decisions to customers, analysts, or regulators. This project uses a simulated 10,000-transaction Credit Card Fraud Detection Dataset with **1.50% fraud** to train, compare, and deploy five classifiers under a cost-aware evaluation framework; SHAP, Break Down, and LIME explain the champion model's decisions, and a live Shiny dashboard enables real-time scoring, batch analysis, and threshold tuning — a fraud-detection system that is accurate, auditable, and cheap to operate.
+
+
+## Objectives
+
+The project pursues eight objectives: 
+(1) clean and audit the raw transaction data, removing duplicates, missing values, and impossible observations;
+(2) perform exploratory data analysis to characterise the 1.50% class imbalance
+and identify fraud patterns;
+(3) engineer domain-driven features such as `amount_log`, `is_night`, `low_trust`, `high_velocity`, and `micro_amount`;
+(4) address imbalance explicitly through up-sampling inside each CV fold and
+PR-AUC tuning; 
+(5) train and tune five classifiers (Logistic Regression, Decision Tree, Random Forest, Gradient Boosting, KNN) under 5-fold cross-validation; 
+(6) evaluate them with business-cost awareness using a $500-per-false-negative and \$25-per-false-positive cost model, selecting the
+threshold that minimises total dollar cost; 
+(7) apply Explainable AI — SHAP,
+Break Down, and LIME — to justify both global behaviour and individual
+predictions; 
+(8) deploy the champion model as a live Shiny dashboard for
+real-time scoring, batch CSV upload, and threshold simulation.
+
+
+# TASK 1: DATA IMPORTATION AND CLEANING
+## 1.1 Import and inspect dataset
+```{r}
+data <- read.csv("credit.csv")
+```
+
+
+### First 6 observations
+```{r}
+head(data)
+```
+
+
+### Last 6 observations
+```{r}
+tail(data)
+```
+
+
+### Variable names
+```{r}
+names(data)
+```
+
+### Data structure
+```{r}
+str(data)
+```
+
+
+### Dimensions (rows × cols)
+```{r}
+dim(data)
+```
+
+## 1.2 Descriptive statistics
+```{r}
+psych::describe(dplyr::select(data, amount, transaction_hour,
+                              device_trust_score, velocity_last_24h,
+                              cardholder_age))
+```
+
+
+## 1.3 Duplicates and missing values
+```{r}
+cat("Duplicates:", sum(duplicated(data)), "\n")
+cat("Missing   :", sum(is.na(data)), "\n")
+colSums(is.na(data))
+```
+
+
+## 1.4 Impossible / unrealistic observations
+```{r}
+data <- data |>
+  mutate(impossible   = amount <= 0,
+         micro_amount = amount > 0 & amount < 0.10,
+         high_value   = amount > 1200)
+
+data |> filter(impossible) |>
+  select(transaction_id, amount, transaction_hour, merchant_category)
+```
+
+
+## 1.5 Clean and save
+```{r}
+data <- data |>
+  filter(amount > 0) |>
+  mutate(
+    is_fraud            = factor(is_fraud,            levels = c(0,1), labels = c("legit","fraud")),
+    foreign_transaction = factor(foreign_transaction, levels = c(0,1), labels = c("no","yes")),
+    location_mismatch   = factor(location_mismatch,   levels = c(0,1), labels = c("no","yes"))
+  )
+
+nrow(data)                    # 9999
+table(data$is_fraud)          # fraud 150 / legit 9849
+write.csv(data, "credit_clean.csv", row.names = FALSE)
+```
+
+
+# TASK 2: DATA WRANGLING AND MANIPULATION
+## 2.1 Reload clean data + factor target
+```{r}
+data <- read.csv("credit_clean.csv") |>
+  mutate(
+    is_fraud            = factor(is_fraud,            levels = c("legit","fraud")),
+    foreign_transaction = factor(foreign_transaction, levels = c("no","yes")),
+    location_mismatch   = factor(location_mismatch,   levels = c("no","yes"))
+  )
+colSums(is.na(data))
+```
+
+
+## 2.2 Select variables
+```{r}
+model_data <- data |>
+  select(transaction_id, amount, transaction_hour, merchant_category,
+         foreign_transaction, location_mismatch, device_trust_score,
+         velocity_last_24h, cardholder_age, is_fraud)
+glimpse(model_data)
+```
+
+
+## 2.3 Create new variables
+```{r}
+model_data <- model_data |>
+  mutate(
+    amount_log    = log1p(amount),
+    is_night      = transaction_hour %in% 0:5,
+    low_trust     = device_trust_score < 40,
+    high_velocity = velocity_last_24h >= 5,
+    age_group     = cut(cardholder_age, breaks = c(17,29,44,59,100),
+                        labels = c("18-29","30-44","45-59","60+"))
+  )
+```
+
+
+## 2.4 Filter observations
+```{r}
+high_risk       <- model_data |> filter(amount > 500, foreign_transaction == "yes", device_trust_score < 50)
+night_fraud     <- model_data |> filter(transaction_hour %in% 0:5, is_fraud == "fraud")
+big_electronics <- model_data |> filter(merchant_category == "Electronics", amount > 1000)
+suspicious      <- model_data |> filter(is_night | high_velocity | low_trust)
+
+cat("High-risk:",        nrow(high_risk),       "\n")
+cat("Night fraud:",      nrow(night_fraud),     "\n")
+cat("Large Electronics:",nrow(big_electronics), "\n")
+cat("Suspicious:",       nrow(suspicious),      "\n")
+```
+
+
+## 2.5 Rename
+```{r}
+model_data <- model_data |>
+  rename(amount_usd   = amount,
+         hour_of_day  = transaction_hour,
+         category     = merchant_category,
+         trust_score  = device_trust_score,
+         velocity_24h = velocity_last_24h,
+         age          = cardholder_age)
+names(model_data)
+```
+
+
+## 2.6 Sort and group
+```{r}
+model_data |> arrange(desc(amount_usd)) |>
+  select(transaction_id, amount_usd, category, is_fraud) |> head(10)
+
+model_data |> group_by(category) |> tally()
+model_data |> group_by(category, is_fraud) |> tally()
+```
+
+
+## 2.7 Summary statistics by group
+```{r}
+category_summary <- model_data |>
+  group_by(category) |>
+  summarise(n = n(),
+            fraud_n     = sum(is_fraud == "fraud"),
+            fraud_rate  = round(fraud_n / n, 4),
+            mean_amount = round(mean(amount_usd), 2),
+            median_amount = round(median(amount_usd), 2),
+            mean_trust  = round(mean(trust_score), 1),
+            mean_velocity = round(mean(velocity_24h), 2),
+            .groups = "drop") |>
+  arrange(desc(fraud_rate))
+
+kable(category_summary,
+      caption = "Table 1 - Fraud summary by merchant category",
+      col.names = c("Category","Transactions","Fraud Count","Fraud Rate",
+                    "Avg Amount","Median Amount","Avg Trust","Avg Velocity"),
+      format = "html") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+*** interpretation.** Only 1.5% of transactions are fraudulent. Fraud is spread across **every** merchant category — Grocery highest at ≈2.0%, Clothing lowest at ≈1.2%, a spread of under one percentage point. Mean trust score is ≈62 in all categories, so trust does not separate them. Combined with the EDA finding that numeric predictors are uncorrelated, this says no single variable separates fraud.
+
+
+
+# TASK 3: EXPLORATORY DATA VISUALIZATION
+## color fix
+```{r}
+
+set.seed(123)
+pal <- c("fraud" = "#B22222", "legit" = "#4682B4")
+```
+
+
+# load clean data , factorlize variable and renaming of varibles
+```{r}
+model_data <- read.csv("credit_clean.csv") |>
+  mutate(is_fraud = factor(is_fraud, levels = c("legit","fraud")),
+         foreign_transaction = factor(foreign_transaction, levels = c("no","yes")),
+         location_mismatch   = factor(location_mismatch,   levels = c("no","yes"))) |>
+  rename(amount_usd = amount, hour_of_day = transaction_hour,
+         category = merchant_category, trust_score = device_trust_score,
+         velocity_24h = velocity_last_24h, age = cardholder_age) |>
+  mutate(amount_log = log1p(amount_usd),
+         is_night   = hour_of_day %in% 0:5)
+```
+
+
+## 3.1 Histogram — amount
+```{r}
+ggplot(model_data, aes(amount_usd)) +
+  geom_histogram(bins = 60, fill = "#4682B4", colour = "white") +
+  geom_vline(xintercept = median(model_data$amount_usd),
+             linetype = "dashed", colour = "#B22222") +
+  
+  labs(title = "Transaction amounts are heavily right-skewed",
+       x = "Amount (USD, log scale)", y = "Count",
+       caption = "Figure 1 - Histogram of amount") + theme_minimal()
+```
+
+*Why histogram:* best view of a single numeric distribution's shape.
+*Reading:* strong right skew; median ≈ $122, mean ≈ $176.
+*Unusual:* a long tail past $1,000 and a hard floor at $0.01 (micro-charges = card-testing signature).
+
+
+## 3.2 Boxplot — amount by class
+```{r}
+ggplot(model_data, aes(is_fraud, amount_usd, fill = is_fraud)) +
+  geom_boxplot(width = .5, outlier.alpha = .4) +
+   scale_fill_manual(values = pal) +
+  labs(title = "Fraudulent transactions are typically larger",
+       x = NULL, y = "Amount (USD, log scale)",
+       caption = "Figure 2 - Amount by class") +
+  theme_classic() + theme(legend.position = "none")
+```
+
+*Why boxplot:* compares distribution of a numeric variable across two classes.
+*Reading:* fraud median ≈ $180 vs legit ≈ $125.
+*Unusual:* high-value outliers concentrated in fraud; heavy overlap means amount alone cannot classify.
+
+
+## 3.3 Scatter — amount vs velocity
+```{r}
+ggplot(model_data, aes(amount_usd, velocity_24h, colour = is_fraud, size = is_fraud)) +
+  geom_point(alpha = .5, width = .04, height = .15) +
+ scale_colour_manual(values = pal) +
+   scale_size_manual(values = c("fraud" = .5, "legit" = 2.9)) +
+  labs(title = "Fraud clusters at high amount AND high velocity",
+       x = "Amount (USD, log scale)", y = "Velocity (24h)",
+       caption = "Figure 3 : Amount × Velocity") + theme_ema_vertical()
+```
+
+*Why scatter:* reveals interactions between two continuous variables.
+*Reading:* fraud (red) concentrates in the upper-right quadrant — strongest bivariate signal in the data.
+*Unusual:* velocity capped at 9; overplotting requires jitter.
+
+
+## 3.4 Bar chart — fraud counts by category
+
+```{r}
+model_data |> count(category, is_fraud) |>
+  ggplot(aes(reorder(category, n), n, fill = is_fraud)) +
+  geom_col(position = "dodge") + scale_fill_manual(values = pal) +
+  coord_flip() +
+  labs(title = "Electronics and Travel dominate absolute fraud counts",
+       x = NULL, y = "Count",
+       caption = "Figure 4 - Counts by category") + theme_minimal()
+```
+
+*Why bar chart:* compares counts across two categorical variables.
+*Reading:* Electronics/Travel have the largest red segments in absolute terms.
+*Unusual:* absolute counts hide rate — Grocery's rate is actually the highest.
+
+
+## 3.5 Pie chart — class imbalance
+```{r}
+model_data |> count(is_fraud) |>
+  mutate(share = n / sum(n),
+         label = paste0(is_fraud, "\n", percent(share, .1))) |>
+  ggplot(aes("", n, fill = is_fraud)) +
+  geom_col(width = 1, colour = "white") + coord_polar("y") +
+  geom_text(aes(label = label), position = position_stack(vjust = .5),
+            colour = "white", fontface = "bold", size = 4) +
+  scale_fill_manual(values = pal) +
+  labs(title = "Only 1.5% of transactions are fraudulent",
+       caption = "Figure 5 - Class distribution") +
+  theme_void() + theme(legend.position = "bottom",
+                       plot.title = element_text(face = "bold", hjust = .5))
+```
+
+*Why pie chart:* part-to-whole for a two-class split.
+*Reading:* the fraud slice is barely visible.
+*Unusual:* its invisibility is the finding — justifies using PR-AUC / recall / F1 instead of accuracy.
+
+
+## 3.6 Correlation heatmap
+```{r}
+num_cols <- c("amount_usd","hour_of_day","trust_score","velocity_24h","age")
+cor_mat  <- cor(model_data[, num_cols], use = "pairwise.complete.obs")
+label_cols <- c("red", "red", "blue", "blue", "darkgreen", "darkgreen")
+corrplot(
+  cor_mat,
+  method      = "color",
+  type        = "upper",
+  order       = "hclust",
+  addCoef.col = "black",
+  tl.col = label_cols,
+  tl.srt      = 45,
+  number.cex  = 0.7,
+  diag        = FALSE
+)
+```
+
+*Why heatmap:* at-a-glance matrix of pairwise relationships.
+*Reading:* all |r| < 0.03 — no multicollinearity.
+*Unusual:* near-zero correlations even for pairs that normally correlate — consistent with independently simulated data.
+
+
+## 3.7 Pair plot
+```{r}
+plot_df <- model_data |> select(amount_log, velocity_24h, trust_score, age, is_fraud)
+suppressMessages(
+  ggpairs(plot_df, aes(colour = is_fraud, fill = is_fraud),
+          lower = list(continuous = wrap("points", size = .35, alpha = .3)),
+          upper = list(continuous = "blank"),
+          diag  = list(continuous = wrap("barDiag", bins = 25, alpha = .7)),
+          progress = FALSE) +
+    scale_colour_manual(values = pal) + scale_fill_manual(values = pal) +
+    ggtitle("Figure 7 - Pair plot: fraud separates on amount × velocity"))
+```
+
+*Why pair plot:* matrix of every pairwise relationship in one figure.
+*Reading:* only the amount_log × velocity_24h panel shows visible class separation.
+*Unusual:* heavy overlap in all other panels; fraud group is sparse (≈150 dots).
+
+
+## 3.8 Violin — trust by category
+```{r}
+ggplot(model_data, aes(reorder(category, trust_score, median),
+                       trust_score, fill = category)) +
+  geom_violin(trim = FALSE, alpha = .7) +
+  geom_boxplot(width = .12,  outlier.size = .5, outlier.alpha = .4) +
+   labs(title = "Device trust is identical across categories",
+       x = NULL, y = "Trust score",
+       caption = "Figure 8 :Trust by category") +
+  theme_minimal() + theme(legend.position = "none",
+                      axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+*Why violin:* compares full distribution shapes across categories (richer than a boxplot).
+*Reading:* all categories centred ≈62, IQR ≈50–78.
+*Unusual:* bimodal shape (peaks near 40 and 80) suggests trust is drawn from two underlying populations.
+
+**EDA conclusion.** Amount is right-skewed → log transform justified. Fraud amounts are larger but overlap heavily → amount alone insufficient. Fraud clusters at high amount × high velocity → tree models are appropriate. Imbalance is severe (1.5%) → PR-metrics and class weighting are mandatory.
+
+
+#TASK 4: MACHINE LEARNING
+
+## 4.1 Load data + factor target
+
+```{r}
+data <- read.csv("credit_clean.csv") |>
+  mutate(
+    is_fraud            = factor(is_fraud,            levels = c("legit","fraud")),
+    foreign_transaction = factor(foreign_transaction, levels = c("no","yes")),
+    location_mismatch   = factor(location_mismatch,   levels = c("no","yes")),
+    merchant_category   = factor(merchant_category)
+  ) |>
+  select(-transaction_id)
+str(data)
+```
+
+
+## 4.2 Stratified split
+```{r}
+set.seed(123)
+idx   <- createDataPartition(data$is_fraud, p = .80, list = FALSE)
+train <- data[ idx, ]
+test <- data[-idx, ]
+cat("Train:", nrow(train), "| Fraud:", sum(train$is_fraud == "fraud"), "\n")
+cat("Test :", nrow(test),  "| Fraud:", sum(test$is_fraud == "fraud"),  "\n")
+```
+
+
+## 4.3 Cross-validation controls
+```{r}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = prSummary,   # needs 2-level factor + classProbs
+  savePredictions = "final",
+  sampling        = "up"         # upsample minority class in training folds
+)
+```
+
+
+## 4.4 Train six models
+```{r}
+# Train the logistic regresiion regression model
+m_lr <- train(is_fraud ~ ., data = train, method = "glm",
+              family = "binomial", trControl = ctrl, metric = "AUC")
+
+# Train the decision tree regression model
+m_dt <- train(is_fraud ~ ., data = train, method = "rpart",
+              trControl = ctrl, metric = "AUC",
+              tuneGrid = expand.grid(cp = c(.0005,.001,.005,.01,.02,.05,.1)))
+
+
+# Train svm model
+
+m_svm <- train(
+  is_fraud ~ .,
+  data       = train,
+  method     = "svmRadial",
+  trControl  = ctrl,
+  metric     = "AUC",
+  preProcess = c("center", "scale")
+)
+
+
+# Train the random forest model
+m_rf <- train(is_fraud ~ ., data = train, method = "rf",
+              trControl = ctrl, metric = "AUC",
+              tuneGrid = expand.grid(mtry = c(2,3)), ntree = 200)
+
+# Train the XGboost  model
+m_gbm <- train(is_fraud ~ ., data = train, method = "gbm",
+               trControl = ctrl, metric = "AUC", verbose = FALSE,
+               tuneGrid = expand.grid(n.trees = c(100,200),
+                                      interaction.depth = c(2,3),
+                                      shrinkage = c(.05,.10),
+                                      n.minobsinnode = 10))
+# Train the k- mean model
+
+m_knn <- train(is_fraud ~ ., data = train, method = "knn",
+               trControl = ctrl, metric = "AUC",
+               preProcess = c("center","scale"),
+               tuneGrid = expand.grid(k = c(3,5,7,9)))
+```
+
+
+## 4.5 Best hyperparameters
+```{r}
+tibble(
+  Model = c("Logistic Regression","Decision Tree","Random Forest",
+            "Gradient Boosting","KNN", "svm"),
+  Best  = c("none",
+            paste("cp =", m_dt$bestTune$cp),
+            paste("mtry =", m_rf$bestTune$mtry),
+            paste("trees =", m_gbm$bestTune$n.trees,
+                  "| depth =", m_gbm$bestTune$interaction.depth,
+                  "| shr =", m_gbm$bestTune$shrinkage),
+            paste("k =", m_knn$bestTune$k),
+            paste("C =", m_svm$bestTune$C,
+                  "| sigma =", m_svm$bestTune$sigma))
+) |>
+  kable(caption = "Table 2 :Best hyperparameters", format = "pipe")
+```
+
+
+## 4.6 Evaluate on hold-out test set
+```{r}
+models <- list("Logistic Regression" = m_lr, "Decision Tree" = m_dt,
+               "Random Forest" = m_rf, "Gradient Boosting" = m_gbm,
+               "KNN" = m_knn,"svm"=m_svm)
+
+evaluate <- function(m, name) {
+  prob <- predict(m, test, type = "prob")[["fraud"]]
+  pred <- factor(ifelse(prob >= .5, "fraud", "legit"), levels = c("legit","fraud"))
+  cm   <- confusionMatrix(pred, test$is_fraud, positive = "fraud")
+  auc  <- as.numeric(auc(roc(test$is_fraud, prob, quiet = TRUE,
+                                          levels = c("legit","fraud"), direction = "<")))
+  pauc <- pr_auc_vec(test$is_fraud, prob, event_level = "second")
+  tibble(Model = name,
+         Accuracy = round(cm$overall["Accuracy"], 3),
+         Precision= round(cm$byClass["Precision"], 3),
+         Recall   = round(cm$byClass["Sensitivity"], 3),
+         Specificity = round(cm$byClass["Specificity"], 3),
+         F1       = round(cm$byClass["F1"], 3),
+         ROC_AUC  = round(auc, 3),
+         PR_AUC   = round(pauc, 3))
+}
+comparison <- imap_dfr(models, evaluate) |> arrange(desc(PR_AUC))
+kable(comparison, caption = "Table 3 :Model leaderboard", format = "html") |>
+  kable_styling(bootstrap_options = c("striped","hover","center"), full_width = FALSE)
+```
+
+## 4.7 Business:cost threshold tuning
+```{r}
+best_prob <- predict(m_gbm, test, type = "prob")[["fraud"]]
+thr_tbl <- tibble(threshold = seq(.05, .95, by = .05)) |>
+  rowwise() |>
+  mutate(
+    TP = sum(best_prob >= threshold & test$is_fraud == "fraud"),
+    FP = sum(best_prob >= threshold & test$is_fraud == "legit"),
+    FN = sum(best_prob <  threshold & test$is_fraud == "fraud"),
+    Precision = ifelse(TP+FP > 0, round(TP/(TP+FP), 3), NA),
+    Recall    = ifelse(TP+FN > 0, round(TP/(TP+FN), 3), NA),
+    F1        = ifelse(!is.na(Precision) & !is.na(Recall) & (Precision+Recall) > 0,
+                       2*Precision*Recall/(Precision+Recall), NA),
+    Cost_USD  = FN*500 + FP*25   # FN = $500, FP = $25
+  ) |> ungroup()
+
+best_thr <- thr_tbl$threshold[which.min(thr_tbl$Cost_USD)]
+cat("Optimal threshold:", best_thr,
+    "\n Min batch cost: ", thr_tbl$Cost_USD[which.min(thr_tbl$Cost_USD)], "\n")
+```
+
+
+## 4.8 Summary visual
+```{r}
+pr_curves <- imap_dfr(models, function(m, name) {
+  prob <- predict(m, test, type = "prob")[["fraud"]]
+  pr <- yardstick::pr_curve(tibble(truth = test$is_fraud, prob = prob),
+                            truth, prob, event_level = "second")
+  pr$Model <- name; pr
+})
+pA <- ggplot(pr_curves, aes(recall, precision, colour = Model)) +
+  geom_path(linewidth = 1) + labs(title = "A. PR curves", x = "Recall", y = "Precision") +
+  theme_minimal() + theme(legend.position = "bottom", legend.text = element_text(size = 7))
+
+roc_df <- purrr::imap_dfr(models, function(m, name) {
+  prob <- predict(m, test, type = "prob")[["fraud"]]
+  r <- pROC::roc(test$is_fraud, prob, quiet = TRUE,
+                 levels = c("legit","fraud"), direction = "<")
+  tibble(Model = name, specificity = rev(r$specificities),
+         sensitivity = rev(r$sensitivities))
+})
+pB <- ggplot(roc_df, aes(1 - specificity, sensitivity, colour = Model)) +
+  geom_abline(linetype = "dashed", colour = "grey50") + geom_path(linewidth = 1) +
+  labs(title = "B. ROC curves", x = "FPR", y = "TPR") +
+  theme_minimal() + theme(legend.position = "none")
+
+pC <- comparison |> select(Model, PR_AUC, Recall, F1) |>
+  pivot_longer(-Model) |>
+  ggplot(aes(reorder(Model, -value), value, fill = name)) +
+  geom_col(position = "dodge") + coord_flip() +
+  labs(title = "C. Key metrics", x = NULL, y = "Score", fill = NULL) + theme_minimal()
+
+pD <- thr_tbl |> select(threshold, Precision, Recall, F1) |>
+  pivot_longer(-threshold) |>
+  ggplot(aes(threshold, value, colour = name)) + geom_line(linewidth = 1) +
+  geom_vline(xintercept = best_thr, linetype = "dashed", colour = "grey40") +
+  labs(title = "D. Threshold trade-off", x = "Threshold", y = "Value", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+(pA | pB) / (pC | pD) + plot_annotation(title = "Figure 4 - Model comparison")
+```
+
+> **Model selection.** Gradient Boosting has the highest PR-AUC, the highest recall, and the lowest dollar cost at the business-optimal threshold. It is also a tree ensemble → SHAP and DALEX explanations in Task 5 are exact rather than approximated.
+
+
+## 4.9 Save artifacts for Task 6
+```{r}
+saveRDS(m_gbm,       "final_model_gbm.rds")
+saveRDS(test,        "test_set.rds")
+saveRDS(comparison,  "model_comparison.rds")
+cat("Saved: final_model_gbm.rds, test_set.rds, model_comparison.rds\n")
+cat("       credit_clean.csv (already written in Task 1.5)\n")
+```
+
+
+# TASK 5 : EXPLAINABLE AI
+## 5.0  Build explainers 
+```{r}
+suppressPackageStartupMessages({ library(DALEX); library(ggplot2) })
+
+x_test <- test |> dplyr::select(-is_fraud)
+y_test <- factor(test$is_fraud, levels = c("legit", "fraud"))
+
+pred_fun <- function(model, newdata)
+  predict(model, newdata = newdata, type = "prob")[, "fraud"]
+
+# 1. verify every model returns a valid probability vector
+cat("--- predict() check ---\n")
+for (nm in names(models)) {
+  p <- tryCatch(pred_fun(models[[nm]], x_test[1:5, , drop = FALSE]),
+                error = function(e) NULL)
+  cat(sprintf("%-22s class: %-10s length: %d\n",
+              nm,
+              if (is.null(p)) "NULL" else class(p),
+              if (is.null(p)) 0L else length(p)))
+}
+
+# 2. build explainers with tryCatch — one bad model cannot poison the list
+explainers <- lapply(names(models), function(nm) {
+  tryCatch(
+    DALEX::explain(
+      model            = models[[nm]],
+      data             = x_test,
+      y                = y_test,
+      predict_function = pred_fun,
+      label            = nm,
+      verbose          = FALSE
+    ),
+    error = function(e) {
+      cat(sprintf("[%s] explain() FAILED: %s\n", nm, conditionMessage(e)))
+      NULL
+    }
+  )
+})
+names(explainers) <- names(models)
+
+# 3. keep only valid explainers
+ok <- vapply(explainers, inherits, logical(1), what = "explainer")
+cat("\nvalid explainers:", sum(ok), "of", length(ok), "\n")
+explainers <- explainers[ok]
+
+stopifnot(length(explainers) > 0)
+cat("ready to explain:", paste(names(explainers), collapse = ", "), "\n")
+```
+
+
+# 5.1 Global feature importance — all six models
+```{r}
+suppressPackageStartupMessages({ library(ggplot2); library(dplyr) })
+
+get_importance <- function(model, name) {
+  fm <- model$finalModel
+
+  out <- tryCatch({
+    if (name == "Gradient Boosting") {
+      n  <- fm$n.trees %||% length(fm$trees)
+      ri <- gbm::relative.influence(fm, n.trees = n, scale. = TRUE)
+      data.frame(Feature = names(ri), Overall = as.numeric(ri), Model = name)
+
+    } else if (name == "Random Forest") {
+      imp <- randomForest::importance(fm)
+      data.frame(Feature = rownames(imp),
+                 Overall = as.numeric(imp[, 1]), Model = name)
+
+    } else if (name == "Decision Tree") {
+      vi <- fm$variable.importance
+      data.frame(Feature = names(vi),
+                 Overall = as.numeric(vi), Model = name)
+
+    } else if (name == "Logistic Regression") {
+      co <- coef(fm); co <- co[!is.na(co) & names(co) != "(Intercept)"]
+      data.frame(Feature = names(co),
+                 Overall = abs(as.numeric(co)), Model = name)
+
+    } else NULL
+  }, error = function(e) {
+    cat(sprintf("[%s] native importance failed: %s\n", name, conditionMessage(e)))
+    NULL
+  })
+
+  if (is.null(out) && name %in% c("KNN", "SVM")) {
+    num_feats <- c("amount","transaction_hour","device_trust_score",
+                   "velocity_last_24h","cardholder_age",
+                   "impossible","micro_amount","high_value")
+    base_auc <- as.numeric(pROC::auc(y_test,
+      predict(model, x_test, type = "prob")[, "fraud"],
+      quiet = TRUE, levels = c("legit","fraud"), direction = "<"))
+    drops <- sapply(num_feats, function(col) {
+      mean(replicate(3, {
+        Xp <- x_test; Xp[[col]] <- sample(Xp[[col]])
+        base_auc - as.numeric(pROC::auc(y_test,
+          predict(model, Xp, type = "prob")[, "fraud"],
+          quiet = TRUE, levels = c("legit","fraud"), direction = "<"))
+      }), na.rm = TRUE)
+    })
+    out <- data.frame(Feature = names(drops), Overall = drops, Model = name)
+  }
+  out
+}
+
+imp <- do.call(rbind, lapply(names(models), function(nm) get_importance(models[[nm]], nm)))
+
+imp <- imp |> group_by(Model) |>
+  mutate(pct = 100 * Overall / max(Overall, na.rm = TRUE)) |> ungroup()
+
+plot_df <- imp |> group_by(Model) |>
+  slice_max(pct, n = 8, with_ties = FALSE) |> ungroup()
+
+ggplot(plot_df, aes(reorder(Feature, pct), pct, fill = pct)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = round(pct, 1)), hjust = -.15, size = 2.8) +
+  coord_flip() + facet_wrap(~ Model, ncol = 3, scales = "free_y") +
+  scale_fill_gradient(low = "#F4A4A4", high = "#B22222") +
+  scale_y_continuous(expand = expansion(mult = c(0, .25))) +
+  labs(title = "Figure X1: Global feature importance — all six models",
+       x = NULL, y = "Relative importance (normalised 0-100)") +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+```
+
+
+
+# 5.2 PDP and ALE — per-model, no list dispatch
+```{r}
+suppressPackageStartupMessages({
+  library(DALEX); library(ggplot2); library(dplyr); library(patchwork)
+})
+
+profile_vars <- c("amount", "velocity_last_24h", "device_trust_score")
+
+# one call per explainer 
+pdp_plots <- list(); ale_plots <- list()
+
+for (nm in names(explainers)) {
+  e <- explainers[[nm]]
+
+  pdp <- tryCatch(
+    DALEX::model_profile(e, variables = profile_vars, type = "partial"),
+    error = function(err) { cat(sprintf("[%s] PDP: %s\n", nm, conditionMessage(err))); NULL })
+  if (!is.null(pdp))
+    pdp_plots[[nm]] <- plot(pdp) + labs(title = nm) +
+      theme(plot.title = element_text(face = "bold", size = 10))
+
+  ale <- tryCatch(
+    DALEX::model_profile(e, variables = profile_vars, type = "accumulated"),
+    error = function(err) { cat(sprintf("[%s] ALE: %s\n", nm, conditionMessage(err))); NULL })
+  if (!is.null(ale))
+    ale_plots[[nm]] <- plot(ale) + labs(title = nm) +
+      theme(plot.title = element_text(face = "bold", size = 10))
+}
+
+if (length(pdp_plots) > 0)
+  print(wrap_plots(pdp_plots, ncol = 2) +
+        plot_annotation(title = "Figure X2a : Partial Dependence"))
+
+if (length(ale_plots) > 0)
+  print(wrap_plots(ale_plots, ncol = 2) +
+        plot_annotation(title = "Figure X2b : Accumulated Local Effects"))
+```
+
+*Reading:* ALE mirrors the PDP shape → effect directions are trustworthy. Amount is flat until ≈$500, then rises sharply. Velocity flat until 4, then jumps at 5+. Trust declines monotonically.
+
+
+## 5.3 SHAP — individual explanation of the clearest fraud
+```{r}
+# use the champion explainer; fall back to the last valid one
+champion <- if ("Gradient Boosting" %in% names(explainers))
+  explainers[["Gradient Boosting"]] else explainers[[length(explainers)]]
+
+# use the function that actually exists
+prob_all <- pred_fun(m_gbm, x_test)
+idx_fp   <- which.max(prob_all * (y_test == "fraud"))
+
+cat("Explaining row", idx_fp,
+    "| P(fraud) =", round(prob_all[idx_fp], 3), "\n")
+
+shap_single <- DALEX::predict_parts(
+  champion,
+  new_observation = x_test[idx_fp, , drop = FALSE],
+  type = "shap"
+)
+plot(shap_single) +
+  labs(title = "Figure X3 : SHAP for one flagged transaction",
+       subtitle = paste("P(fraud) =", round(prob_all[idx_fp], 3)))
+```
+
+
+## 5.4 Break Down — sequential narrative
+```{r}
+bd <- DALEX::predict_parts(
+  champion,
+  new_observation = x_test[idx_fp, , drop = FALSE],
+  type = "break_down"
+)
+plot(bd) + labs(title = "Figure X4 — Break Down explanation")
+```
+
+
+# 5.5 LIME — independent cross-check
+```{r}
+suppressPackageStartupMessages({
+  library(lime); library(ggplot2); library(dplyr); library(tidyr); library(corrplot)
+})
+
+set.seed(123)
+
+# ---- 0. background + explainer set-up (safe if re-run) -------------
+if (!exists("bg_data")) bg_data <- x_test
+if (!exists("lime_expls")) {
+  lime_expls <- setNames(
+    lapply(names(models), function(nm) {
+      tryCatch(
+        lime::lime(bg_data, model = lime::as_classifier(models[[nm]],
+                                                        labels = c("legit","fraud")),
+                   bin_continuous = TRUE, n_bins = 5,
+                   quantile_bins = TRUE, verbose = FALSE),
+        error = function(e) NULL)
+    }), names(models))
+  lime_expls <- lime_expls[!vapply(lime_expls, is.null, logical(1))]
+}
+
+pos_label <- "fraud"
+idx_fp    <- which(y_test == "fraud")[which.max(pred_fun(m_gbm, x_test)[y_test == "fraud"])]
+one_row   <- bg_data[idx_fp, , drop = FALSE]
+
+# ---- 1. Explain once per model -------------------------------------
+lime_out <- list()
+for (nm in names(lime_expls)) {
+  out <- tryCatch(
+    lime::explain(
+      x = one_row, explainer = lime_expls[[nm]],
+      labels = pos_label, n_features = 10, n_permutations = 3000,
+      kernel_width = 0.75, dist_fun = "gower",
+      feature_select = "auto", verbose = FALSE),
+    error = function(e) NULL)
+  if (!is.null(out) && nrow(out) > 0) lime_out[[nm]] <- out
+}
+
+if (length(lime_out) == 0) {
+  cat("No LIME explanations produced.\n")
+} else {
+
+  # ---- 2. tidy long --------------------------------------------------
+  d <- bind_rows(lapply(names(lime_out), function(nm) {
+    lime_out[[nm]] |>
+      mutate(model = nm) |>
+      select(model, feature, feature_weight)
+  })) |>
+    mutate(feature = recode(feature,
+      "amount"              = "Amount",
+      "transaction_hour"    = "Hour",
+      "merchant_category"   = "Merchant",
+      "foreign_transaction" = "Foreign txn",
+      "location_mismatch"   = "Location mismatch",
+      "device_trust_score"  = "Trust score",
+      "velocity_last_24h"   = "Velocity 24h",
+      "cardholder_age"      = "Age"))
+
+  # ---- 3. sorted single-panel bar chart ------------------------------
+  top_n <- 6
+  top <- d |>
+    group_by(model) |>
+    slice_max(abs(feature_weight), n = top_n, with_ties = FALSE) |>
+    ungroup() |>
+    mutate(label = paste0(feature, " [", model, "]"))
+
+  p <- ggplot(top, aes(x = feature_weight,
+                       y = reorder(label, feature_weight),
+                       fill = feature_weight > 0)) +
+    geom_col(width = 0.72) +
+    geom_vline(xintercept = 0, colour = "grey35", linewidth = 0.4) +
+    scale_fill_manual(
+      values = c(`TRUE` = "#B2182B", `FALSE` = "#2166AC"),
+      labels = c(`TRUE` = "pushes toward fraud",
+                 `FALSE` = "pushes toward legit"),
+      name = NULL) +
+    labs(x = "LIME weight (contribution to P(fraud))", y = NULL,
+         title = "Figure X5 — LIME — same transaction, all models",
+         subtitle = sprintf("Row %d | top-%d features per model, sorted by weight",
+                            idx_fp, top_n)) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position    = "bottom",
+          panel.grid.major.y = element_blank(),
+          plot.title         = element_text(face = "bold"),
+          plot.subtitle      = element_text(colour = "grey40"))
+
+  print(p)
+
+  # ---- 4. model × feature heatmap (corrplot) -------------------------
+  mat_long <- d |>
+    group_by(model, feature) |>
+    summarise(w = mean(feature_weight), .groups = "drop")
+
+  keep <- mat_long |>
+    group_by(feature) |>
+    summarise(m = mean(abs(w)), .groups = "drop") |>
+    slice_max(m, n = 8) |>
+    pull(feature)
+
+  wide <- mat_long |>
+    filter(feature %in% keep) |>
+    pivot_wider(names_from = feature, values_from = w, values_fill = 0) |>
+    tibble::column_to_rownames("model") |>
+    as.matrix()
+
+  col_pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(200)
+
+  corrplot(
+    wide,
+    is.corr       = FALSE,
+    method        = "color",
+    col           = col_pal,
+    tl.col        = "black",
+    tl.srt        = 35,
+    tl.cex        = 0.85,
+    cl.cex        = 0.8,
+    addCoef.col   = "black",
+    number.cex    = 0.7,
+    cl.pos        = "r",
+    mar           = c(0, 0, 2, 0),
+    title         = sprintf("LIME weights — row %d", idx_fp)
+  )
+}
+```
+
+***Interpretation.** Globally, `amount`, `velocity_last_24h`, `device_trust_score` carry most predictive power. Locally, every flagged transaction decomposes cleanly into those three drivers plus hour and the foreign flag. **SHAP, Break Down, and LIME agree on the top-3 ranking** — the explanation is robust. Business uses: analyst screens quoting top drivers, GDPR Art-22-compliant customer dispute letters, and monthly mean-|SHAP| monitoring for fraud-tactic drift.
+
+
+## ✅ Artifacts saved
+
+Four files land in `C:/Users/ADMIN/OneDrive/Desktop/caleb makini/app/project`:
+
+```
+credit_clean.csv
+final_model_gbm.rds
+test_set.rds
+model_comparison.rds
+```
+
+
+
+## Conclusion
+
+Fraud here is rare (1.5%), spread evenly across categories, and detectable only through feature interactions. Under 5-fold cost-aware cross-validation, Gradient Boosting wins on PR-AUC, recall, and dollar cost; Random Forest is close behind, while Logistic Regression and KNN degrade under imbalance and Decision Tree overfits. Threshold choice is the second pillar. With a missed fraud costing 20× a false alarm ($500 vs $25), the naive 0.5 cutoff is wrong. A sweep preserves ~90% recall while cutting false positives from hundreds to dozens — thousands saved per batch, with no model change. Explainability ties it together: permutation importance, SHAP, Break Down, and LIME agree on the top-3 drivers for flagged cases, evidence the reasoning is stable and audit-defensible. The Shiny dashboard operationalises all of it — real-time scoring with risk bands and explanations, batch upload with metrics, case review, interactive threshold tuning, and a model leaderboard. Three propositions follow: ML beats rules only when imbalanced metrics drive selection; explainability is operationally valuable, not ornamental; a model is only as good as its operating point. Caveats: simulated data inflates AUC, thresholds were tuned on test, costs are illustrative, and monitoring plus quarterly retraining are essential.
+
+**Recommendations:** deploy Gradient Boosting with a cost-calibrated threshold, adopt a two-tier policy (auto-approve <0.30, challenge 0.30–0.55, block >0.55), attach explanations to every flagged case, monitor monthly, and retrain quarterly. The real contest is not model size but how fast each decision can be justified to analyst, customer, and regulator.
