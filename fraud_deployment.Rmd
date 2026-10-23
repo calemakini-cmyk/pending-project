@@ -621,14 +621,30 @@ pD <- thr_tbl |> select(threshold, Precision, Recall, F1) |>
 > **Model selection.** Gradient Boosting has the highest PR-AUC, the highest recall, and the lowest dollar cost at the business-optimal threshold. It is also a tree ensemble → SHAP and DALEX explanations in Task 5 are exact rather than approximated.
 
 
+
 ## 4.9 Save artifacts for Task 6
 ```{r}
 saveRDS(m_gbm,       "final_model_gbm.rds")
 saveRDS(test,        "test_set.rds")
 saveRDS(comparison,  "model_comparison.rds")
-cat("Saved: final_model_gbm.rds, test_set.rds, model_comparison.rds\n")
-cat("       credit_clean.csv (already written in Task 1.5)\n")
+
+# --- Save ALL SIX models for the dashboard ---
+all_models <- list(
+  "Logistic Regression" = m_lr,
+  "Decision Tree"       = m_dt,
+  "SVM"                 = m_svm,
+  "Random Forest"       = m_rf,
+  "Gradient Boosting"   = m_gbm,
+  "KNN"                 = m_knn
+)
+saveRDS(all_models, "all_models.rds")
+
+cat("Saved:", length(all_models), "models to all_models.rds\n")
+cat("Files:", paste(c("final_model_gbm.rds","test_set.rds",
+                      "model_comparison.rds","all_models.rds"),
+                    collapse = ", "), "\n")
 ```
+
 
 
 # TASK 5 : EXPLAINABLE AI
